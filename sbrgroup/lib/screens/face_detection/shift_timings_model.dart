@@ -98,10 +98,14 @@ int? shiftIdForTime(List<Map<String, dynamic>> shifts, DateTime now) {
 /// How long after a shift ends a guard is still assumed to be logging out of
 /// *that* shift rather than into the one that just started.
 ///
-/// Three hours covers a normal handover plus a late finish. Past that the
-/// guard is treated as belonging to the shift now running, and can still
-/// change the dropdown.
-const Duration kLogoutGrace = Duration(hours: 3);
+/// Four hours covers a normal handover plus the overtime these guards
+/// actually work. Past that the guard is treated as belonging to the shift now
+/// running, and can still change the dropdown.
+///
+/// Widening this trades one end for the other: it is a 12-hour window being
+/// slid later, so every hour gained for a late finish is an hour lost at the
+/// start, where someone leaving early gets offered the previous shift instead.
+const Duration kLogoutGrace = Duration(hours: 4);
 
 /// The shift a guard logging out at [now] is most likely *ending*.
 ///
@@ -118,6 +122,24 @@ const Duration kLogoutGrace = Duration(hours: 3);
 /// have just finished for as long as a handover realistically takes.
 int? shiftIdForLogout(List<Map<String, dynamic>> shifts, DateTime now) =>
     shiftIdForTime(shifts, now.subtract(kLogoutGrace));
+
+/// How early a guard can turn up and still be offered the shift they are about
+/// to *start* rather than the one still running.
+///
+/// Guards report before their shift begins — a morning guard at ten to six is
+/// starting the morning shift, not joining the night one that is about to end.
+/// One hour covers reporting early without reaching so far back that a guard
+/// arriving mid-shift is offered the wrong one.
+const Duration kEarlyArrivalGrace = Duration(hours: 1);
+
+/// The shift a guard logging in at [now] is most likely *starting*.
+///
+/// Resolving the time [kEarlyArrivalGrace] later lets someone who reports
+/// before the hour be offered the shift they came in for. It is the mirror of
+/// [shiftIdForLogout]: logout looks back to the shift just finished, login
+/// looks forward to the one about to begin.
+int? shiftIdForLogin(List<Map<String, dynamic>> shifts, DateTime now) =>
+    shiftIdForTime(shifts, now.add(kEarlyArrivalGrace));
 
 class ShiftTiming {
   final int id;

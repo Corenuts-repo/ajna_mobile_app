@@ -141,7 +141,7 @@ class _AttendanceScreenState extends State<FaceAttendanceScreen> {
           // Open on the shift that is running now, so the guard confirms
           // rather than works it out. Null leaves the dropdown empty, as
           // before, and they pick.
-          final suggested = shiftIdForTime(_shifts, DateTime.now());
+          final suggested = shiftIdForLogin(_shifts, DateTime.now());
           if (suggested != null) {
             _selectedShiftId = suggested;
           }
