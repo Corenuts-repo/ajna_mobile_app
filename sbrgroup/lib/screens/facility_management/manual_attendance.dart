@@ -895,14 +895,13 @@ class _ManualAttendanceScreenState extends State<ManualAttendanceScreen> {
 
   /// Asks where the punch should go.
   ///
-  /// Everywhere but where it already is — moving it to its own site is an undo,
-  /// which is a different action with its own button.
+  /// Every site is offered, the punch's own included. The web used to filter
+  /// that one out and no longer does, so re-selecting the current site is a
+  /// supported move rather than something the list hides.
   Future<_MoveRequest?> _askDestination(ManualAttendanceRecord row) async {
-    final destinations =
-        _locations.where((l) => l.id != row.locationId).toList();
+    final destinations = _locations;
     if (destinations.isEmpty) {
-      _toast('No other site is available to move this attendance to.',
-          error: true);
+      _toast('No site is available to move this attendance to.', error: true);
       return null;
     }
 
