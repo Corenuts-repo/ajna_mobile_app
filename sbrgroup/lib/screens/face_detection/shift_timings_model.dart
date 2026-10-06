@@ -98,14 +98,20 @@ int? shiftIdForTime(List<Map<String, dynamic>> shifts, DateTime now) {
 /// How long after a shift ends a guard is still assumed to be logging out of
 /// *that* shift rather than into the one that just started.
 ///
-/// Four hours covers a normal handover plus the overtime these guards
-/// actually work. Past that the guard is treated as belonging to the shift now
-/// running, and can still change the dropdown.
+/// The shifts start at 8:00 AM and 8:00 PM (`commonRefValue` on the
+/// `Shift_Timings` rows). Two hours keeps a guard on the shift just finished
+/// until 9:59 AM / 9:59 PM. Past that they are treated as belonging to the
+/// shift now running, and can still change the dropdown.
 ///
 /// Widening this trades one end for the other: it is a 12-hour window being
 /// slid later, so every hour gained for a late finish is an hour lost at the
 /// start, where someone leaving early gets offered the previous shift instead.
-const Duration kLogoutGrace = Duration(hours: 4);
+///
+/// Size these two allowances against the REAL start times, not assumed ones.
+/// They were first tuned for 6:00 starts; against 8:00 starts that left the
+/// morning login beginning at 7:00, and guards reporting at 6:40 were saved
+/// on the night shift.
+const Duration kLogoutGrace = Duration(hours: 2);
 
 /// The shift a guard logging out at [now] is most likely *ending*.
 ///
@@ -126,11 +132,14 @@ int? shiftIdForLogout(List<Map<String, dynamic>> shifts, DateTime now) =>
 /// How early a guard can turn up and still be offered the shift they are about
 /// to *start* rather than the one still running.
 ///
-/// Guards report before their shift begins — a morning guard at ten to six is
-/// starting the morning shift, not joining the night one that is about to end.
-/// One hour covers reporting early without reaching so far back that a guard
-/// arriving mid-shift is offered the wrong one.
-const Duration kEarlyArrivalGrace = Duration(hours: 1);
+/// Guards report well before their shift begins — morning guards arrive from
+/// around 6:40 for an 8:00 AM start. Three hours opens the morning login at
+/// 5:00 AM and the night login at 5:00 PM, which is also where the backend
+/// draws the line (`LOGGIN_START = 5`, `LOGGIN_START_NIGHT = 17`).
+///
+/// It is safe at both ends: a night guard never first logs in between 5 and
+/// 8 AM, and a morning guard never first logs in between 5 and 8 PM.
+const Duration kEarlyArrivalGrace = Duration(hours: 3);
 
 /// The shift a guard logging in at [now] is most likely *starting*.
 ///
