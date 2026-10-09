@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:ajna/screens/api_endpoints.dart';
 import 'package:ajna/screens/connectivity_handler.dart';
@@ -9,6 +10,7 @@ import 'package:ajna/theme/app_colors.dart';
 import 'package:ajna/theme/form_fields.dart';
 import 'package:ajna/theme/responsive.dart';
 import 'package:dropdown_button2/dropdown_button2.dart';
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 
@@ -50,7 +52,10 @@ class _EmployeeListScreenState extends State<EmployeeListScreen> {
   int? _roleId;
   int? _managerId;
   int? _shiftId;
-  String _status = 'A';
+
+  /// Fixed at Active. The web's Status filter is commented out of its template
+  /// — resigned staff have their own register — so it is not offered here.
+  static const String _status = 'A';
   String _name = '';
   String _number = '';
   String _designation = '';
@@ -61,6 +66,7 @@ class _EmployeeListScreenState extends State<EmployeeListScreen> {
   bool _loading = false;
   bool _loadingMore = false;
   bool _filtersExpanded = false;
+  bool _uploadingManagers = false;
   String? _error;
 
   /// The web shows the Role column to TECH ADMIN only.
@@ -269,7 +275,6 @@ class _EmployeeListScreenState extends State<EmployeeListScreen> {
       _roleId = null;
       _managerId = null;
       _shiftId = null;
-      _status = 'A';
       _name = '';
       _number = '';
       _designation = '';
@@ -294,8 +299,74 @@ class _EmployeeListScreenState extends State<EmployeeListScreen> {
       ),
     );
     if (saved == true) {
+      // The web's confirmation, shown once the list is back.
+      _toast(employeeId == null
+          ? 'Employee added successfully'
+          : 'Employee updated successfully');
       await _fetch(reset: true);
     }
+  }
+
+  /// The web's "Upload Managers": an Excel sheet that reassigns reporting
+  /// managers in bulk. TECH ADMIN only, as on the web.
+  Future<void> _uploadManagers() async {
+    final String? path;
+    try {
+      final result = await FilePicker.platform.pickFiles(
+        type: FileType.custom,
+        allowedExtensions: const ['xlsx', 'xls'],
+      );
+      path = result?.files.single.path;
+    } catch (e) {
+      debugPrint('Employees: manager file pick error $e');
+      _toast('Could not open the file picker.', error: true);
+      return;
+    }
+    if (path == null) return;
+
+    setState(() => _uploadingManagers = true);
+    try {
+      final response = await ApiService.uploadManagersExcel(File(path));
+      final message = _serverMessage(response.body);
+      if (ApiService.isSuccess(response.statusCode)) {
+        _toast(message ?? 'Managers updated successfully');
+        await _fetch(reset: true);
+      } else {
+        debugPrint('Employees: manager upload failed '
+            '${response.statusCode} ${response.body}');
+        _toast(message ?? 'Failed to upload managers file', error: true);
+      }
+    } catch (e) {
+      debugPrint('Employees: manager upload error $e');
+      _toast('Could not reach the server. Please try again.', error: true);
+    } finally {
+      if (mounted) setState(() => _uploadingManagers = false);
+    }
+  }
+
+  String? _serverMessage(String body) {
+    try {
+      final decoded = jsonDecode(body);
+      final message = decoded is Map ? decoded['message'] : null;
+      if (message is String && message.trim().isNotEmpty) {
+        return message.trim();
+      }
+    } catch (_) {
+      // Not JSON — the caller's friendly fallback stands.
+    }
+    return null;
+  }
+
+  void _toast(String message, {bool error = false}) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(
+        content: Text(message),
+        backgroundColor: error ? AppColors.danger : AppColors.success,
+        behavior: SnackBarBehavior.floating,
+        duration: const Duration(seconds: 3),
+      ));
   }
 
   // ------------------------------------------------------------------- view
@@ -328,6 +399,26 @@ class _EmployeeListScreenState extends State<EmployeeListScreen> {
         ),
         centerTitle: true,
         iconTheme: const IconThemeData(color: AppColors.onPrimary),
+        actions: [
+          if (_showsRole)
+            _uploadingManagers
+                ? const Padding(
+                    padding: EdgeInsets.symmetric(horizontal: 16),
+                    child: Center(
+                      child: SizedBox(
+                        height: 18,
+                        width: 18,
+                        child: CircularProgressIndicator(
+                            strokeWidth: 2, color: AppColors.onPrimary),
+                      ),
+                    ),
+                  )
+                : IconButton(
+                    tooltip: 'Upload managers',
+                    icon: const Icon(Icons.upload_file),
+                    onPressed: _uploadManagers,
+                  ),
+        ],
       ),
       floatingActionButton: FloatingActionButton.extended(
         backgroundColor: AppColors.primary,
@@ -453,6 +544,7 @@ class _EmployeeListScreenState extends State<EmployeeListScreen> {
                       Text(
                         [
                           if (row.employeeId.isNotEmpty) row.employeeId,
+                          if (row.gender.isNotEmpty) row.gender,
                           if (row.designation.isNotEmpty) row.designation,
                           if (_showsRole && row.employeeRoleName.isNotEmpty)
                             row.employeeRoleName,
@@ -590,68 +682,47 @@ class _EmployeeListScreenState extends State<EmployeeListScreen> {
               },
             ),
             const SizedBox(height: 12),
-            Row(
-              children: [
-                Expanded(
-                  child: DropdownButtonFormField2<int?>(
-                    isExpanded: true,
-                    value: _roleId,
-                    decoration: fieldDecoration('Role'),
-                    dropdownStyleData: menuStyle(context),
-                    menuItemStyleData: kMenuItemStyle,
-                    items: [
-                      const DropdownMenuItem<int?>(
-                          value: null, child: Text('All roles')),
-                      ..._roles.map((r) => DropdownMenuItem<int?>(
-                            value: r.roleId,
-                            child: Text(r.roleName,
-                                overflow: TextOverflow.ellipsis),
-                          )),
-                    ],
-                    onChanged: (value) {
-                      setState(() => _roleId = value);
-                      _reload();
-                    },
-                  ),
-                ),
-                const SizedBox(width: 10),
-                Expanded(
-                  child: DropdownButtonFormField2<int?>(
-                    isExpanded: true,
-                    value: _shiftId,
-                    decoration: fieldDecoration('Shift'),
-                    dropdownStyleData: menuStyle(context),
-                    menuItemStyleData: kMenuItemStyle,
-                    items: [
-                      const DropdownMenuItem<int?>(
-                          value: null, child: Text('All shifts')),
-                      ..._shifts.map((s) => DropdownMenuItem<int?>(
-                            value: s.id,
-                            child:
-                                Text(s.value, overflow: TextOverflow.ellipsis),
-                          )),
-                    ],
-                    onChanged: (value) {
-                      setState(() => _shiftId = value);
-                      _reload();
-                    },
-                  ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 12),
-            DropdownButtonFormField2<String>(
+            // The web offers the Role filter to TECH ADMIN only, the same users
+            // who see the Role column.
+            if (_showsRole) ...[
+              DropdownButtonFormField2<int?>(
+                isExpanded: true,
+                value: _roleId,
+                decoration: fieldDecoration('Role'),
+                dropdownStyleData: menuStyle(context),
+                menuItemStyleData: kMenuItemStyle,
+                items: [
+                  const DropdownMenuItem<int?>(
+                      value: null, child: Text('All roles')),
+                  ..._roles.map((r) => DropdownMenuItem<int?>(
+                        value: r.roleId,
+                        child:
+                            Text(r.roleName, overflow: TextOverflow.ellipsis),
+                      )),
+                ],
+                onChanged: (value) {
+                  setState(() => _roleId = value);
+                  _reload();
+                },
+              ),
+              const SizedBox(height: 12),
+            ],
+            DropdownButtonFormField2<int?>(
               isExpanded: true,
-              value: _status,
-              decoration: fieldDecoration('Status'),
-              dropdownStyleData: menuStyle(context, maxHeight: 160),
+              value: _shiftId,
+              decoration: fieldDecoration('Shift timings'),
+              dropdownStyleData: menuStyle(context),
               menuItemStyleData: kMenuItemStyle,
-              items: const [
-                DropdownMenuItem(value: 'A', child: Text('Active')),
-                DropdownMenuItem(value: 'I', child: Text('Inactive')),
+              items: [
+                const DropdownMenuItem<int?>(
+                    value: null, child: Text('All shifts')),
+                ..._shifts.map((s) => DropdownMenuItem<int?>(
+                      value: s.id,
+                      child: Text(s.value, overflow: TextOverflow.ellipsis),
+                    )),
               ],
               onChanged: (value) {
-                setState(() => _status = value ?? 'A');
+                setState(() => _shiftId = value);
                 _reload();
               },
             ),
@@ -766,7 +837,6 @@ class _EmployeeListScreenState extends State<EmployeeListScreen> {
     }
 
     final parts = <String>[
-      _status == 'A' ? 'Active' : 'Inactive',
       nameOf(_projects, _projectId, (p) => p.projectId, (p) => p.projectName),
       nameOf(_roles, _roleId, (r) => r.roleId, (r) => r.roleName),
       nameOf(_managers, _managerId, (m) => m.userId, (m) => m.userName),
@@ -775,7 +845,7 @@ class _EmployeeListScreenState extends State<EmployeeListScreen> {
       _number,
       _designation,
     ].where((s) => s.isNotEmpty).toList();
-    return parts.join(' · ');
+    return parts.isEmpty ? 'All employees' : parts.join(' · ');
   }
 
   Widget _banner(String text) {

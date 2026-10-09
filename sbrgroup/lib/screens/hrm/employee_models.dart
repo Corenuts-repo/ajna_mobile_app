@@ -149,6 +149,16 @@ class EmployeeBean {
   int? userId;
   int? organizationId;
   String isAddAsUserNeeded;
+
+  /// 'Y' / 'N'. The web's Health Issue switch; the description is only asked
+  /// for, and required, while it is 'Y'.
+  String healthIssue;
+  String healthIssueDescription;
+
+  /// Stored S3 links the web sets. Not edited here, but carried through an
+  /// update — leaving them out of the payload would clear them.
+  String healthIssueUrl;
+  String photoUrl;
   String shift;
   String title;
   String religion;
@@ -235,6 +245,10 @@ class EmployeeBean {
     this.userId,
     this.organizationId,
     this.isAddAsUserNeeded = 'Yes',
+    this.healthIssue = 'N',
+    this.healthIssueDescription = '',
+    this.healthIssueUrl = '',
+    this.photoUrl = '',
     this.shift = '',
     this.title = '',
     this.religion = '',
@@ -315,6 +329,11 @@ class EmployeeBean {
       userId: _int(json['userId']),
       organizationId: _int(json['organizationId']),
       isAddAsUserNeeded: _str(json['isAddAsUserNeeded']),
+      healthIssue:
+          _str(json['healthIssue']).isEmpty ? 'N' : _str(json['healthIssue']),
+      healthIssueDescription: _str(json['healthIssueDescription']),
+      healthIssueUrl: _str(json['healthIssueUrl']),
+      photoUrl: _str(json['photoUrl']),
       shift: _str(json['shift']),
       title: _str(json['title']),
       religion: _str(json['religion']),
@@ -395,6 +414,10 @@ class EmployeeBean {
     _put(json, 'userId', userId);
     _put(json, 'organizationId', organizationId);
     _put(json, 'isAddAsUserNeeded', isAddAsUserNeeded);
+    _put(json, 'healthIssue', healthIssue);
+    _put(json, 'healthIssueDescription', healthIssueDescription);
+    _put(json, 'healthIssueUrl', healthIssueUrl);
+    _put(json, 'photoUrl', photoUrl);
     _put(json, 'shift', shift);
     _put(json, 'title', title);
     _put(json, 'religion', religion);
@@ -533,6 +556,10 @@ class EmployeeAddress {
 
 /// Mirrors EmployeeEducationBean.
 class EmployeeEducation {
+  /// Stored S3 link to the row's attachment (set by the web). Carried through
+  /// an update so a mobile edit does not clear it.
+  String attachmentUrl = '';
+
   int id;
   int? qualification;
   String institute;
@@ -576,7 +603,7 @@ class EmployeeEducation {
       endDate: dateFromWire(json['endDate']),
       employeeId: _int(json['employeeId']) ?? 0,
       stepperStatus: _int(json['stepperStatus']) ?? 0,
-    );
+    )..attachmentUrl = _str(json['attachmentUrl']);
   }
 
   Map<String, dynamic> toJson() {
@@ -592,12 +619,17 @@ class EmployeeEducation {
     _put(json, 'remarks', remarks);
     _put(json, 'startDate', dateToWire(startDate));
     _put(json, 'endDate', dateToWire(endDate));
+    _put(json, 'attachmentUrl', attachmentUrl);
     return json;
   }
 }
 
 /// Mirrors EmployeeFamilyBean.
 class EmployeeFamily {
+  /// 'Yes' / 'No' — which member the web marked as the emergency contact.
+  /// Carried through an update so a mobile edit does not clear it.
+  String isEmergencyContact = '';
+
   int id;
   String name;
   String relationship;
@@ -654,7 +686,7 @@ class EmployeeFamily {
       employeeId: _int(json['employeeId']) ?? 0,
       stepperStatus: _int(json['stepperStatus']) ?? 0,
       familyMemberId: _str(json['familyMemberId']),
-    );
+    )..isEmergencyContact = _str(json['isEmergencyContact']);
   }
 
   Map<String, dynamic> toJson() {
@@ -675,12 +707,17 @@ class EmployeeFamily {
     _put(json, 'pincode', pincode);
     _put(json, 'city', city);
     _put(json, 'familyMemberId', familyMemberId);
+    _put(json, 'isEmergencyContact', isEmergencyContact);
     return json;
   }
 }
 
 /// Mirrors EmployeeExperienceBean. `jobdescription` is lower-case on the wire.
 class EmployeeExperience {
+  /// Stored S3 link to the row's attachment (set by the web). Carried through
+  /// an update so a mobile edit does not clear it.
+  String attachmentUrl = '';
+
   int id;
   String companyName;
   String jobTitle;
@@ -719,7 +756,7 @@ class EmployeeExperience {
       jobdescription: _str(json['jobdescription']),
       employeeId: _int(json['employeeId']) ?? 0,
       stepperStatus: _int(json['stepperStatus']) ?? 0,
-    );
+    )..attachmentUrl = _str(json['attachmentUrl']);
   }
 
   Map<String, dynamic> toJson() {
@@ -734,6 +771,7 @@ class EmployeeExperience {
     _put(json, 'startDate', dateToWire(startDate));
     _put(json, 'endDate', dateToWire(endDate));
     _put(json, 'jobdescription', jobdescription);
+    _put(json, 'attachmentUrl', attachmentUrl);
     return json;
   }
 }
@@ -743,6 +781,10 @@ class EmployeeExperience {
 /// The three include flags are 'Yes'/'No' strings on the wire, not booleans —
 /// the column is a varchar and a real boolean is rejected.
 class EmployeeBankDetails {
+  /// Stored S3 link to the bank passbook / cancelled cheque (set by the web).
+  /// Carried through an update so a mobile edit does not clear it.
+  String attachmentUrl = '';
+
   int id;
   int employeeId;
   String bankName;
@@ -803,7 +845,7 @@ class EmployeeBankDetails {
       mobileNumber: _str(json['mobileNumber']),
       status: _str(json['status']).isEmpty ? 'A' : _str(json['status']),
       stepperStatus: _int(json['stepperStatus']) ?? 0,
-    );
+    )..attachmentUrl = _str(json['attachmentUrl']);
   }
 
   Map<String, dynamic> toJson() {
@@ -827,6 +869,7 @@ class EmployeeBankDetails {
     _put(json, 'uanNumber', uanNumber);
     _put(json, 'lwfInclude', lwfInclude);
     _put(json, 'mobileNumber', mobileNumber);
+    _put(json, 'attachmentUrl', attachmentUrl);
     return json;
   }
 }
@@ -1011,6 +1054,23 @@ class ProjectOption {
 
 /// A work location — a qr_generator row, the same list the attendance screens
 /// read.
+/// An employee, as the Attendance Manager picker lists them — hrm-service's
+/// `employee/getAllEmpoyees`. The value stored is the employee row `id`, not a
+/// user id: that is what the web writes to `attendanceManager`.
+class EmployeeOption {
+  final int id;
+  final String name;
+
+  EmployeeOption({required this.id, required this.name});
+
+  factory EmployeeOption.fromJson(Map<String, dynamic> json) {
+    return EmployeeOption(
+      id: _int(json['id']) ?? 0,
+      name: '${_str(json['firstName'])} ${_str(json['lastName'])}'.trim(),
+    );
+  }
+}
+
 class WorkLocationOption {
   final int id;
   final String location;

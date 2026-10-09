@@ -475,8 +475,8 @@ class ApiService {
   /// Activates or deactivates a QR. Status 'A' is active, 'I' inactive.
   /// Preferred over delete, which would orphan the scan history.
   static Future<http.Response> updateQrStatus(int id, String status) async {
-    return await putRequest(
-        baseUrl2, 'api/facility-management/facility/status/$id?status=$status', {});
+    return await putRequest(baseUrl2,
+        'api/facility-management/facility/status/$id?status=$status', {});
   }
 
   static Future<http.Response> postQrData(Map<String, dynamic> qrData) async {
@@ -2078,11 +2078,12 @@ class ApiService {
   /// Creates an employee.
   ///
   /// [employeeSaveDtoJson] is the encoded EmployeeSaveDto and [documents] the
-  /// identity files. Documents are optional to the backend even though the web
+  /// identity files, keyed by the filename to upload them under (see
+  /// [_sendEmployee] for why the name matters). Documents are optional to the backend even though the web
   /// form marks Aadhaar required — that rule lives in the browser only.
   static Future<http.Response> submitEmployee(
     String employeeSaveDtoJson,
-    List<File> documents,
+    Map<String, File> documents,
   ) async {
     return await _sendEmployee(
         'POST', '$_employee/submitEmployee', employeeSaveDtoJson, documents);
@@ -2096,7 +2097,7 @@ class ApiService {
   /// [getEmployeeById], never from a blank form.
   static Future<http.Response> updateEmployee(
     String employeeSaveDtoJson,
-    List<File> documents,
+    Map<String, File> documents,
   ) async {
     return await _sendEmployee(
         'PUT', '$_employee/update', employeeSaveDtoJson, documents);
@@ -2106,11 +2107,17 @@ class ApiService {
   ///
   /// The DTO goes in as a string field rather than as JSON: the endpoint takes
   /// it as `@RequestPart("employeeSaveDto") String` and parses it itself.
+  ///
+  /// THE FILENAME IS THE ROUTING. The backend decides which column a document
+  /// belongs to from its original filename (`contains("Adhar")`, `"Pan"`, …),
+  /// so each file is sent under the name the caller gives it — the web's
+  /// `{docType}_{originalName}` — never the phone's own `IMG_1234.jpg`, which
+  /// uploads to S3 but is linked to nothing.
   static Future<http.Response> _sendEmployee(
     String method,
     String endpoint,
     String employeeSaveDtoJson,
-    List<File> documents,
+    Map<String, File> documents,
   ) async {
     await initialize();
 
@@ -2118,10 +2125,11 @@ class ApiService {
         http.MultipartRequest(method, Uri.parse('$baseUrl1$endpoint'));
     request.fields['employeeSaveDto'] = employeeSaveDtoJson;
 
-    for (final file in documents) {
-      if (!await file.exists()) continue;
+    for (final entry in documents.entries) {
+      if (!await entry.value.exists()) continue;
       request.files.add(
-        await http.MultipartFile.fromPath('employeeDocuments', file.path),
+        await http.MultipartFile.fromPath('employeeDocuments', entry.value.path,
+            filename: entry.key),
       );
     }
 
@@ -2139,6 +2147,63 @@ class ApiService {
 
   static Future<http.Response> deleteEmployee(int id) async {
     return await deleteRequest(baseUrl1, '$_employee/$id');
+  }
+
+  /// Email / phone uniqueness, as the web's Add Employee checks them on blur.
+  /// The backend answers a duplicate with an error status, so any non-2xx
+  /// response means "already exists".
+  static Future<http.Response> checkEmailExists(String email) async {
+    return await postRequest(
+        baseUrl1, 'api/user/user/checkEmail', {'email': email});
+  }
+
+  static Future<http.Response> checkPhoneNumberExists(
+      String phoneNumber) async {
+    return await postRequest(baseUrl1, 'api/user/user/checkPhoneNumber',
+        {'phoneNumber': phoneNumber});
+  }
+
+  /// The next free employee number, e.g. for an organisation with onboarding
+  /// rules. The web treats a non-empty `employeeNumber` here as "onboarding
+  /// rules are on" and pre-fills the number on a new employee.
+  static Future<http.Response> getNextEmployeeNumber(int organizationId) async {
+    return await getRequest(baseUrl1,
+        '$_employee/nextEmployeeNumber?organizationId=$organizationId');
+  }
+
+  /// Working employees of the organisation — the web's Attendance Manager list.
+  static Future<http.Response> getAttendanceManagers(int organizationId) async {
+    return await getRequest(baseUrl1,
+        '$_employee/getAllEmpoyees?orgId=$organizationId&employeeName=');
+  }
+
+  /// Attendance locations of one project — used instead of [fetchLocation]
+  /// when onboarding rules are on and a project is chosen, as the web does.
+  static Future<http.Response> fetchAttendanceLocationsByProject(
+      int organizationId, int projectId) async {
+    return await getRequest(baseUrl2,
+        'api/facility-management/facility/getAllAttendanceLocation?orgId=$organizationId&projectId=$projectId');
+  }
+
+  /// Bulk-assigns reporting managers from an Excel sheet — the web's
+  /// "Upload Managers" button. One multipart part, `file`.
+  static Future<http.Response> uploadManagersExcel(File file) async {
+    await initialize();
+
+    final request = http.MultipartRequest(
+        'POST', Uri.parse('$baseUrl1$_employee/upload-managers'));
+    request.files.add(await http.MultipartFile.fromPath('file', file.path));
+
+    if (accessToken != null) {
+      request.headers['Authorization'] = 'Bearer $accessToken';
+    }
+    if (userId != null) {
+      request.headers['proxyId'] = userId.toString();
+      request.headers['userId'] = userId.toString();
+    }
+
+    final streamed = await request.send();
+    return await http.Response.fromStream(streamed);
   }
 
   // --- Employee child rows -------------------------------------------------
@@ -2159,6 +2224,16 @@ class ApiService {
 
   static Future<http.Response> deleteEmployeeExperience(int id) async {
     return await deleteRequest(baseUrl1, 'api/hrm/employee-experience/$id');
+  }
+
+  /// The bytes of a stored employee document, for viewing — the web's
+  /// `viewDocuments`. [filePath] is the S3 url saved on the record; the server
+  /// fetches it, so the phone never needs bucket access. [fileType] only
+  /// names the file in the response header.
+  static Future<http.Response> downloadEmployeeDocument(
+      String fileType, String filePath) async {
+    return await getRequest(baseUrl3,
+        'api/project/paymentdetails/download/$fileType?filePath=${Uri.encodeComponent(filePath)}&disposition=inline');
   }
 
   /// One reference row looked up by its key rather than by its type.

@@ -80,13 +80,16 @@ android {
         //
         // Cost is Android 5.0/5.1 (API 21-22), a 2014 release. WorkHub has
         // shipped minSdk 23 for years.
-        minSdk = 23
+        //
+        // 24, not 23: Play's automatic protection rejects a bundle below
+        // API 24, which drops Android 6.0 (a 2015 release).
+        minSdk = 24
         targetSdk = 36
         versionCode = flutterVersionCode.toInteger()
         versionName = flutterVersionName
     }
 
-    // Belt and braces: with minSdk 23 AGP already picks this, but stating it
+    // Belt and braces: with minSdk >= 23 AGP already picks this, but stating it
     // means a future minSdk change cannot silently reintroduce the 16 KB
     // failure.
     packaging {

@@ -11,7 +11,10 @@ import 'package:dropdown_button2/dropdown_button2.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:image_picker/image_picker.dart';
 import 'package:intl/intl.dart';
+import 'package:open_file/open_file.dart';
+import 'package:path_provider/path_provider.dart';
 
 /// Add or edit an employee — the mobile form of the web's
 /// `employee/addemployee`, which serves both the same way.
@@ -50,6 +53,19 @@ class _EmployeeFormScreenState extends State<EmployeeFormScreen> {
 
   late EmployeeSaveDto _dto;
   int? _organizationId;
+  String? _roleName;
+
+  /// The web's "onboarding rules": on when `nextEmployeeNumber` returns a
+  /// number. They pre-fill the employee number on a new employee, drop the
+  /// emergency-contact and shift questions, narrow work locations to the
+  /// chosen project, and make blood group, bank details and family details
+  /// required (the web's `ajnaRequiredFields`) — optional for everyone else.
+  bool _onboardingRules = false;
+
+  /// The web shows Role to organisation 2 and to TECH ADMIN only; everyone
+  /// else's employees get the role the backend defaults.
+  bool get _showsRole =>
+      _organizationId == 2 || (_roleName ?? '').toUpperCase() == 'TECH ADMIN';
 
   bool _loading = true;
   bool _saving = false;
@@ -65,14 +81,25 @@ class _EmployeeFormScreenState extends State<EmployeeFormScreen> {
   List<RefOption> _qualificationAreas = [];
   List<RefOption> _employeeStatuses = [];
   List<ManagerOption> _managers = [];
+  List<EmployeeOption> _attendanceManagers = [];
   List<RoleOption> _roles = [];
   List<ProjectOption> _projects = [];
   List<WorkLocationOption> _workLocations = [];
 
-  /// Documents picked in this session, keyed by the field they belong to. The
-  /// backend takes them as one unnamed `employeeDocuments` array, so the order
-  /// they are added in is the order they are sent.
+  /// Files picked in this session, keyed by the web's docType — `Adhar_card`,
+  /// `Health_issue`, `bank`, or `family_member_2` / `education_0` for a row.
+  /// Each is uploaded as `{key}_{originalName}`; the backend routes it by that
+  /// name. Picking again for the same key replaces the earlier file.
   final Map<String, File> _pickedDocuments = {};
+
+  /// Email / phone as loaded, so an unchanged value on edit is not re-checked.
+  String _originalEmail = '';
+  String _originalPhone = '';
+  bool _emailExists = false;
+  bool _phoneExists = false;
+
+  /// Under onboarding rules, the family row picked as the emergency contact.
+  int? _emergencyIndex;
 
   /// Which panels are open. Basic starts open; the rest are a tap away so the
   /// form does not open as a wall of ninety fields.
@@ -81,13 +108,23 @@ class _EmployeeFormScreenState extends State<EmployeeFormScreen> {
   final Map<String, TextEditingController> _text = {};
   final Map<String, TextEditingController> _menuSearch = {};
 
+  /// The prefix is the web's docType — the backend reads it out of the
+  /// filename to decide which column the upload belongs to.
   static const List<_DocumentSlot> _documentSlots = [
-    _DocumentSlot('adharUrl', 'Aadhaar'),
-    _DocumentSlot('panUrl', 'PAN'),
-    _DocumentSlot('voterIdUrl', 'Voter ID'),
-    _DocumentSlot('passPortUrl', 'Passport'),
-    _DocumentSlot('rationCardUrl', 'Ration card'),
+    _DocumentSlot('adharUrl', 'Aadhaar', 'Adhar_card'),
+    _DocumentSlot('panUrl', 'PAN', 'Pan_card'),
+    _DocumentSlot('voterIdUrl', 'Voter ID', 'Voter_card'),
+    _DocumentSlot('passPortUrl', 'Passport', 'PassPort_card'),
+    _DocumentSlot('rationCardUrl', 'Ration card', 'Ration_card'),
   ];
+
+  static const List<String> _bloodGroups = [
+    'A+', 'A-', 'B+', 'B-', 'AB+', 'AB-', 'O+', 'O-', 'Not Known' //
+  ];
+
+  /// The web pre-selects this role for organisation 1 when its users, who do
+  /// not see the Role field, add an employee.
+  static const int _defaultRoleIdOrgOne = 146;
 
   @override
   void initState() {
@@ -122,17 +159,123 @@ class _EmployeeFormScreenState extends State<EmployeeFormScreen> {
 
   Future<void> _bootstrap() async {
     _organizationId = await Util.getOrganizationId();
+    _roleName = await Util.getRoleName();
 
-    await _loadReferenceData();
+    final nextNumber = await Future.wait([
+      _loadReferenceData(),
+      _loadNextEmployeeNumber(),
+    ]).then((results) => results[1] as String?);
+    _onboardingRules = nextNumber != null;
 
     if (_isEdit) {
       await _loadEmployee();
     } else {
       _dto = EmployeeSaveDto.blank(organizationId: _organizationId ?? 0);
+      // Pre-filled, not locked — the web leaves the field editable too.
+      if (nextNumber != null) _dto.employeeBean.employeeId = nextNumber;
+      if (!_showsRole && _organizationId == 1) {
+        _dto.employeeBean.employeeRoleId = _defaultRoleIdOrgOne;
+      }
+    }
+
+    _originalEmail = _isEdit ? _dto.employeeBean.email.trim() : '';
+    _originalPhone = _isEdit ? _dto.employeeBean.phoneNumber.trim() : '';
+    final emergency = _dto.employeeFamilyBeanList
+        .indexWhere((f) => f.isEmergencyContact == 'Yes');
+    _emergencyIndex = emergency >= 0 ? emergency : null;
+
+    if (_onboardingRules && _dto.employeeBean.projectAssigned != null) {
+      await _loadLocationsForProject(_dto.employeeBean.projectAssigned!);
     }
 
     if (!mounted) return;
     setState(() => _loading = false);
+  }
+
+  /// The web's duplicate checks. A non-2xx answer means the value is taken; a
+  /// network failure is not treated as a duplicate (the save would then fail
+  /// on the server with its own message).
+  Future<void> _checkEmail() async {
+    final email = _dto.employeeBean.email.trim();
+    if (email.isEmpty ||
+        (_isEdit && email == _originalEmail) ||
+        !RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$').hasMatch(email)) {
+      if (_emailExists) setState(() => _emailExists = false);
+      return;
+    }
+    try {
+      final response = await ApiService.checkEmailExists(email);
+      if (!mounted || _dto.employeeBean.email.trim() != email) return;
+      setState(() => _emailExists = !ApiService.isSuccess(response.statusCode));
+    } catch (e) {
+      debugPrint('Employee form: email check error $e');
+    }
+  }
+
+  Future<void> _checkPhone() async {
+    final phone = _dto.employeeBean.phoneNumber.trim();
+    if (!RegExp(r'^[0-9]{10}$').hasMatch(phone) ||
+        (_isEdit && phone == _originalPhone)) {
+      if (_phoneExists) setState(() => _phoneExists = false);
+      return;
+    }
+    try {
+      final response = await ApiService.checkPhoneNumberExists(phone);
+      if (!mounted || _dto.employeeBean.phoneNumber.trim() != phone) return;
+      setState(() => _phoneExists = !ApiService.isSuccess(response.statusCode));
+    } catch (e) {
+      debugPrint('Employee form: phone check error $e');
+    }
+  }
+
+  /// The next employee number, or null when the organisation has no
+  /// onboarding rules (or the call fails — the form then behaves as before).
+  Future<String?> _loadNextEmployeeNumber() async {
+    if (_organizationId == null) return null;
+    try {
+      final response = await ApiService.getNextEmployeeNumber(_organizationId!);
+      if (response.statusCode == 200 && response.body.trim().isNotEmpty) {
+        final decoded = jsonDecode(response.body);
+        final number = decoded is Map ? decoded['employeeNumber'] : null;
+        final text = number?.toString().trim() ?? '';
+        return text.isEmpty ? null : text;
+      }
+      debugPrint('Employee form: next number ${response.statusCode}');
+    } catch (e) {
+      debugPrint('Employee form: next number error $e');
+    }
+    return null;
+  }
+
+  /// Under onboarding rules the work locations are the chosen project's. A
+  /// location that is not in the new list is cleared, as the web does.
+  Future<void> _loadLocationsForProject(int projectId) async {
+    if (_organizationId == null) return;
+    try {
+      final response = await ApiService.fetchAttendanceLocationsByProject(
+          _organizationId!, projectId);
+      if (response.statusCode == 200) {
+        final decoded = jsonDecode(response.body);
+        if (decoded is List) {
+          final locations = decoded
+              .whereType<Map<String, dynamic>>()
+              .map(WorkLocationOption.fromJson)
+              .toList();
+          if (!mounted) return;
+          setState(() {
+            _workLocations = locations;
+            final current = _dto.employeeBean.workLocation;
+            if (current != null && !locations.any((l) => l.id == current)) {
+              _dto.employeeBean.workLocation = null;
+            }
+          });
+          return;
+        }
+      }
+      debugPrint('Employee form: project locations ${response.statusCode}');
+    } catch (e) {
+      debugPrint('Employee form: project locations error $e');
+    }
   }
 
   Future<void> _loadEmployee() async {
@@ -207,6 +350,8 @@ class _EmployeeFormScreenState extends State<EmployeeFormScreen> {
           ProjectOption.fromJson, 'projects'),
       fetchList(() => ApiService.fetchLocation(_organizationId!),
           WorkLocationOption.fromJson, 'work locations'),
+      fetchList(() => ApiService.getAttendanceManagers(_organizationId!),
+          EmployeeOption.fromJson, 'attendance managers'),
     ]);
 
     if (!mounted) return;
@@ -222,6 +367,7 @@ class _EmployeeFormScreenState extends State<EmployeeFormScreen> {
     _roles = results[9] as List<RoleOption>;
     _projects = results[10] as List<ProjectOption>;
     _workLocations = results[11] as List<WorkLocationOption>;
+    _attendanceManagers = results[12] as List<EmployeeOption>;
   }
 
   // ------------------------------------------------------------------ save
@@ -229,42 +375,23 @@ class _EmployeeFormScreenState extends State<EmployeeFormScreen> {
   Future<void> _save() async {
     FocusScope.of(context).unfocus();
 
+    // The web will not leave Basic Details while either is a duplicate.
+    await Future.wait([_checkEmail(), _checkPhone()]);
+    if (!mounted) return;
+
+    // Checked against the record, not the widgets: a collapsed section's
+    // fields are not built, so the Form cannot see them.
+    final missing = _firstMissing();
+    if (missing != null) {
+      _openSection(missing.section);
+      _toast(missing.message, error: true);
+      // Once the section is open, outline what is wrong in it.
+      WidgetsBinding.instance
+          .addPostFrameCallback((_) => _formKey.currentState?.validate());
+      return;
+    }
     if (!(_formKey.currentState?.validate() ?? false)) {
-      // A failed field can be inside a collapsed panel, where the red outline
-      // is invisible. Say which section rather than leaving the supervisor
-      // opening all eight to find it.
-      _toast(_firstInvalidSectionMessage(), error: true);
-      return;
-    }
-    if (_dto.employeeBean.dateOfBirth == null) {
-      _openSection('basic');
-      _toast('Date of birth is required.', error: true);
-      return;
-    }
-    if (_dto.employeeBean.dateOfJoining == null) {
-      _openSection('position');
-      _toast('Date of joining is required.', error: true);
-      return;
-    }
-    // Chips are outside the Form, so this is checked by hand. Attendance calls
-    // `employee.getShift().equals("Yes")` with no null guard, so saving without
-    // an answer leaves a record that later breaks a punch.
-    if (_dto.employeeBean.shift.trim().isEmpty) {
-      _openSection('position');
-      _toast('Choose Yes or No for rotational shift.', error: true);
-      return;
-    }
-    if (_dto.employeeBean.isInProbation.trim().isEmpty) {
-      _openSection('position');
-      _toast('Choose Yes or No for probation.', error: true);
-      return;
-    }
-    // Aadhaar is the one document the web insists on — satisfied by a file
-    // picked now or one already on the record.
-    if (_pickedDocuments['adharUrl'] == null &&
-        _dto.employeeBean.adharUrl.trim().isEmpty) {
-      _openSection('documents');
-      _toast('Upload the Aadhaar document.', error: true);
+      _toast('Please correct the highlighted fields.', error: true);
       return;
     }
 
@@ -288,8 +415,23 @@ class _EmployeeFormScreenState extends State<EmployeeFormScreen> {
         }
       }
 
+      if (_onboardingRules) {
+        final family = _dto.employeeFamilyBeanList;
+        for (var i = 0; i < family.length; i++) {
+          family[i].isEmergencyContact = _emergencyIndex == i ? 'Yes' : 'No';
+        }
+      }
+
       final payload = jsonEncode(_dto.toJson());
-      final documents = _pickedDocuments.values.toList();
+      // `{docType}_{stamp}.{ext}`, not the original name: the backend routes
+      // by substring (`contains("Pan")`, `"Pass"`, …), so a phone filename
+      // such as `Pancake.jpg` would file a Voter ID as the PAN card. Row keys
+      // keep the index third (`family_member_2_…`), where the backend reads it.
+      final stamp = DateTime.now().millisecondsSinceEpoch;
+      final documents = <String, File>{
+        for (final entry in _pickedDocuments.entries)
+          '${entry.key}_$stamp.${_extension(entry.value.path)}': entry.value,
+      };
 
       final response = _isEdit
           ? await ApiService.updateEmployee(payload, documents)
@@ -344,19 +486,164 @@ class _EmployeeFormScreenState extends State<EmployeeFormScreen> {
     return null;
   }
 
-  String _firstInvalidSectionMessage() {
+  /// The first required answer that is missing, in the web's section order,
+  /// with the section that holds it.
+  _Missing? _firstMissing() {
     final bean = _dto.employeeBean;
-    if (bean.employeeId.trim().isEmpty ||
-        bean.firstName.trim().isEmpty ||
-        bean.email.trim().isEmpty ||
-        bean.phoneNumber.trim().isEmpty ||
-        bean.gender.trim().isEmpty ||
-        bean.nationalId.trim().isEmpty) {
-      _openSection('basic');
-      return 'Basic details are incomplete.';
+    bool blank(String v) => v.trim().isEmpty;
+    final tenDigits = RegExp(r'^[0-9]{10}$');
+
+    _Missing basic(String m) => _Missing('basic', m);
+    if (_emailExists) {
+      return basic('This Email already exists. Please enter another.');
     }
-    _openSection('position');
-    return 'Position details are incomplete.';
+    if (_phoneExists) {
+      return basic('This Phone Number already exists. Please enter another.');
+    }
+    if (blank(bean.employeeId)) return basic('Employee number is required.');
+    if (blank(bean.firstName)) return basic('First name is required.');
+    if (!RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$').hasMatch(bean.email.trim())) {
+      return basic('Email is not valid.');
+    }
+    if (!tenDigits.hasMatch(bean.phoneNumber.trim())) {
+      return basic('Phone number must be 10 digits.');
+    }
+    if (bean.dateOfBirth == null) return basic('Date of birth is required.');
+
+    _Missing personal(String m) => _Missing('personal', m);
+    if (!RegExp(r'^([0-9]{12}|[A-Z]{5}[0-9]{4}[A-Z])$')
+        .hasMatch(bean.nationalId.trim().toUpperCase())) {
+      return personal('Aadhaar must be 12 digits or PAN like ABCDE1234F.');
+    }
+    if (blank(bean.gender)) return personal('Gender is required.');
+    if (_onboardingRules && blank(bean.bloodGroup)) {
+      return personal('Blood group is required.');
+    }
+    if (!_onboardingRules) {
+      if (blank(bean.emergencyContactName)) {
+        return personal('Emergency contact name is required.');
+      }
+      if (!tenDigits.hasMatch(bean.emergencyContactNumber.trim())) {
+        return personal('Emergency contact number must be 10 digits.');
+      }
+    }
+    if (bean.healthIssue == 'Y' && blank(bean.healthIssueDescription)) {
+      return personal('Describe the health issue.');
+    }
+
+    _Missing position(String m) => _Missing('position', m);
+    if (bean.dateOfJoining == null) {
+      return position('Date of joining is required.');
+    }
+    if (bean.reportingManager == null) {
+      return position('Reporting manager is required.');
+    }
+    if (bean.attendanceManager == null) {
+      return position('Attendance manager is required.');
+    }
+    if (bean.projectAssigned == null) return position('Project is required.');
+    if (blank(bean.employeeStatus)) {
+      return position('Employee status is required.');
+    }
+    // Attendance calls `employee.getShift().equals("Yes")` with no null guard,
+    // so a record saved without an answer later breaks a punch.
+    if (!_onboardingRules) {
+      if (bean.shiftId == null) return position('Shift is required.');
+      if (blank(bean.shift)) {
+        return position('Choose Yes or No for rotational shift.');
+      }
+    }
+    if (bean.workLocation == null) {
+      return position('Work location is required.');
+    }
+    if (blank(bean.designation)) return position('Designation is required.');
+    if (_showsRole && bean.employeeRoleId == null) {
+      return position('Role is required.');
+    }
+    if (bean.department == null) return position('Department is required.');
+    if (blank(bean.isInProbation)) {
+      return position('Choose Yes or No for probation.');
+    }
+    if (bean.isInProbation == 'Yes' && (bean.probationPeriod ?? 0) < 1) {
+      return position('Enter probation period days.');
+    }
+
+    // Aadhaar — satisfied by a file picked now or one already on the record.
+    if (_pickedDocuments['Adhar_card'] == null && blank(bean.adharUrl)) {
+      return const _Missing('documents', 'Aadhaar Card is required.');
+    }
+
+    final bank = _dto.employeeBankDetails;
+    if (_onboardingRules &&
+        (blank(bank.bankName) ||
+            blank(bank.bankAccountNumber) ||
+            blank(bank.bankIfscCode))) {
+      return const _Missing(
+          'bank', 'Please enter all required fields in Bank Details');
+    }
+    if (_onboardingRules &&
+        _pickedDocuments['bank'] == null &&
+        blank(bank.attachmentUrl)) {
+      return const _Missing(
+          'bank', 'Please upload the Bank Passbook / Cancelled Cheque');
+    }
+
+    final family = _dto.employeeFamilyBeanList;
+    if (_onboardingRules) {
+      for (var i = 0; i < family.length; i++) {
+        final f = family[i];
+        if (blank(f.name) ||
+            blank(f.relationship) ||
+            blank(f.contactNo) ||
+            blank(f.address) ||
+            blank(f.country) ||
+            blank(f.city) ||
+            blank(f.pincode)) {
+          return _Missing('family',
+              'Please enter all required fields in Employee Family Details (member ${i + 1})');
+        }
+      }
+    }
+
+    // The web's onboarding check, run after the sections.
+    if (_onboardingRules) {
+      final index = _emergencyIndex;
+      if (index == null || index >= family.length) {
+        if (blank(bean.emergencyContactNumber)) {
+          return const _Missing(
+              'family', 'Select a family member as the emergency contact');
+        }
+      } else {
+        final member = family[index];
+        if (blank(member.name)) {
+          return const _Missing('family',
+              'Enter the name of the emergency contact family member');
+        }
+        if (!tenDigits.hasMatch(member.contactNo.trim())) {
+          return const _Missing('family',
+              'Enter a valid 10 digit contact number for the emergency contact');
+        }
+        if (member.contactNo.trim() == bean.phoneNumber.trim()) {
+          return const _Missing('family',
+              'Emergency contact number must be different from the employee phone number');
+        }
+      }
+    }
+    return null;
+  }
+
+  /// Keeps row-indexed uploads (`family_member_3`, …) pointing at the right
+  /// row after row [removed] is dropped — the web renumbers the same way.
+  void _shiftRowDocuments(String prefix, int removed) {
+    final moved = <String, File>{};
+    _pickedDocuments.removeWhere((key, file) {
+      if (!key.startsWith('${prefix}_')) return false;
+      final index = int.tryParse(key.substring(prefix.length + 1));
+      if (index == null || index < removed) return false;
+      if (index > removed) moved['${prefix}_${index - 1}'] = file;
+      return true;
+    });
+    _pickedDocuments.addAll(moved);
   }
 
   /// Drops one row of a repeated section, deleting it on the server first when
@@ -459,13 +746,14 @@ class _EmployeeFormScreenState extends State<EmployeeFormScreen> {
                             const SizedBox(height: 12),
                           ],
                           _basicSection(),
+                          _personalSection(),
                           _positionSection(),
-                          _addressSection(),
+                          _documentsSection(),
                           _educationSection(),
                           _bankSection(),
-                          _familySection(),
                           _experienceSection(),
-                          _documentsSection(),
+                          _addressSection(),
+                          _familySection(),
                         ],
                       ),
                     ),
@@ -604,6 +892,9 @@ class _EmployeeFormScreenState extends State<EmployeeFormScreen> {
     );
   }
 
+  /// Basic and Personal share one employee row, split the way the web splits
+  /// them (its `personalFields`). Title, PAN, ESI and PF are carried on the
+  /// web's form but not shown there; they stay here so nothing is lost.
   Widget _basicSection() {
     final bean = _dto.employeeBean;
     return _section(
@@ -622,90 +913,52 @@ class _EmployeeFormScreenState extends State<EmployeeFormScreen> {
           _field(
               'lastName', 'Last name', bean.lastName, (v) => bean.lastName = v),
         ),
-        _field('email', 'Email', bean.email, (v) => bean.email = v,
+        _field(
+            'email',
+            'Email',
+            bean.email,
+            (v) {
+              bean.email = v;
+              if (_emailExists) setState(() => _emailExists = false);
+            },
             required: true,
-            keyboardType: TextInputType.emailAddress, validator: (value) {
-          final text = (value ?? '').trim();
-          if (text.isEmpty) return 'Required';
-          final ok = RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$').hasMatch(text);
-          return ok ? null : 'Enter a valid email';
-        }),
-        _field('phoneNumber', 'Phone number', bean.phoneNumber,
-            (v) => bean.phoneNumber = v,
+            keyboardType: TextInputType.emailAddress,
+            onBlur: _checkEmail,
+            validator: (value) {
+              final text = (value ?? '').trim();
+              if (text.isEmpty) return 'Email is required.';
+              if (_emailExists) {
+                return 'This Email already exists. Please enter another.';
+              }
+              final ok = RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$').hasMatch(text);
+              return ok ? null : 'Email is not valid.';
+            }),
+        _field(
+            'phoneNumber',
+            'Phone number',
+            bean.phoneNumber,
+            (v) {
+              bean.phoneNumber = v;
+              if (_phoneExists) setState(() => _phoneExists = false);
+            },
             required: true,
             keyboardType: TextInputType.phone,
             maxLength: 10,
-            digitsOnly: true, validator: (value) {
-          final text = (value ?? '').trim();
-          if (text.isEmpty) return 'Required';
-          return RegExp(r'^[0-9]{10}$').hasMatch(text)
-              ? null
-              : 'Must be 10 digits';
-        }),
+            digitsOnly: true,
+            onBlur: _checkPhone,
+            validator: (value) {
+              final text = (value ?? '').trim();
+              if (text.isEmpty) return 'Phone Number is required.';
+              if (_phoneExists) {
+                return 'This Phone Number already exists. Please enter another.';
+              }
+              return RegExp(r'^[0-9]{10}$').hasMatch(text)
+                  ? null
+                  : 'Phone number must be 10 digits.';
+            }),
         _dateField('Date of birth', bean.dateOfBirth,
             (d) => setState(() => bean.dateOfBirth = d),
             required: true, lastDate: DateTime.now()),
-        _choice('Gender', bean.gender, const ['Male', 'Female', 'Other'],
-            (v) => setState(() => bean.gender = v)),
-        // Aadhaar (12 digits) or PAN (ABCDE1234F) — the same rule the web
-        // applies, so a record entered on a phone is accepted by both.
-        _field('nationalId', 'Aadhaar / PAN', bean.nationalId,
-            (v) => bean.nationalId = v,
-            required: true, validator: (value) {
-          final text = (value ?? '').trim().toUpperCase();
-          if (text.isEmpty) return 'Required';
-          final ok =
-              RegExp(r'^([0-9]{12}|[A-Z]{5}[0-9]{4}[A-Z])$').hasMatch(text);
-          return ok ? null : '12-digit Aadhaar or a PAN like ABCDE1234F';
-        }),
-        _field('panId', 'PAN number', bean.panId, (v) => bean.panId = v),
-        _row(
-          _field('title', 'Title', bean.title, (v) => bean.title = v),
-          _field('fatherName', "Father's name", bean.fatherName,
-              (v) => bean.fatherName = v),
-        ),
-        _choice(
-            'Marital status',
-            bean.maritalStatus,
-            const ['Single', 'Married', 'Divorced', 'Widowed'],
-            (v) => setState(() => bean.maritalStatus = v)),
-        _dateField('Marriage date', bean.marriageDate,
-            (d) => setState(() => bean.marriageDate = d),
-            lastDate: DateTime.now()),
-        _field('spouseName', 'Spouse name', bean.spouseName,
-            (v) => bean.spouseName = v),
-        _row(
-          _field(
-              'religion', 'Religion', bean.religion, (v) => bean.religion = v),
-          _field('cast', 'Caste', bean.cast, (v) => bean.cast = v),
-        ),
-        _row(
-          _field('bloodGroup', 'Blood group', bean.bloodGroup,
-              (v) => bean.bloodGroup = v),
-          _field('identificationMark', 'Identification mark',
-              bean.identificationMark, (v) => bean.identificationMark = v),
-        ),
-        _row(
-          _field('height', 'Height', bean.height, (v) => bean.height = v),
-          _field('weight', 'Weight', bean.weight, (v) => bean.weight = v),
-        ),
-        _row(
-          _field('nationality', 'Nationality', bean.nationality,
-              (v) => bean.nationality = v),
-          _field('country', 'Country', bean.country, (v) => bean.country = v),
-        ),
-        _field('plcaeOfBirth', 'Place of birth', bean.plcaeOfBirth,
-            (v) => bean.plcaeOfBirth = v),
-        _choice(
-            'Physically challenged',
-            bean.physicallyChallenged,
-            const ['Yes', 'No'],
-            (v) => setState(() => bean.physicallyChallenged = v)),
-        _field('personalEmail', 'Personal email', bean.personalEmail,
-            (v) => bean.personalEmail = v,
-            keyboardType: TextInputType.emailAddress),
-        _field('address', 'Address', bean.address, (v) => bean.address = v,
-            maxLines: 2),
         _row(
           _field('city', 'City', bean.city, (v) => bean.city = v),
           _field('state', 'State', bean.state, (v) => bean.state = v),
@@ -713,17 +966,101 @@ class _EmployeeFormScreenState extends State<EmployeeFormScreen> {
         _field('postalCode', 'Postal code', bean.postalCode?.toString() ?? '',
             (v) => bean.postalCode = int.tryParse(v.trim()),
             keyboardType: TextInputType.number, digitsOnly: true),
+        _field('title', 'Title', bean.title, (v) => bean.title = v),
+        _field('panId', 'PAN number', bean.panId, (v) => bean.panId = v),
         _row(
-          _field('emergencyContactName', 'Emergency contact',
-              bean.emergencyContactName, (v) => bean.emergencyContactName = v),
+          _field('esiNumber', 'ESI number', bean.esiNumber,
+              (v) => bean.esiNumber = v),
+          _field('pfUanNo', 'PF UAN number', bean.pfUanNo,
+              (v) => bean.pfUanNo = v),
+        ),
+        // No "create a login" question: the web removed it and always sends
+        // isAddAsUserNeeded = 'Yes' (the model's default), so this does too.
+      ],
+    );
+  }
+
+  Widget _personalSection() {
+    final bean = _dto.employeeBean;
+    return _section(
+      id: 'personal',
+      title: 'Personal Details',
+      icon: Icons.assignment_ind_outlined,
+      subtitle: 'Required',
+      children: [
+        // Aadhaar (12 digits) or PAN (ABCDE1234F) — the same rule the web
+        // applies, so a record entered on a phone is accepted by both.
+        _field('nationalId', 'Aadhaar / PAN', bean.nationalId,
+            (v) => bean.nationalId = v,
+            required: true, validator: (value) {
+          final text = (value ?? '').trim().toUpperCase();
+          if (text.isEmpty) return 'Aadhaar / PAN Id is required.';
+          final ok =
+              RegExp(r'^([0-9]{12}|[A-Z]{5}[0-9]{4}[A-Z])$').hasMatch(text);
+          return ok
+              ? null
+              : 'Aadhaar must be 12 digits or PAN like ABCDE1234F.';
+        }),
+        _choice('Gender', bean.gender, const ['Male', 'Female', 'Other'],
+            (v) => setState(() => bean.gender = v),
+            required: true),
+        _choice(
+            'Marital status',
+            bean.maritalStatus,
+            const ['Single', 'Married'],
+            (v) => setState(() => bean.maritalStatus = v)),
+        _field('address', 'Address', bean.address, (v) => bean.address = v,
+            maxLines: 2),
+        _row(
+          _field(
+              'religion', 'Religion', bean.religion, (v) => bean.religion = v),
+          _field('cast', 'Caste', bean.cast, (v) => bean.cast = v),
+        ),
+        _stringDropdown('Blood group', _bloodGroups, bean.bloodGroup,
+            (v) => setState(() => bean.bloodGroup = v),
+            required: _onboardingRules),
+        _field('identificationMark', 'Identification mark',
+            bean.identificationMark, (v) => bean.identificationMark = v),
+        _row(
+          _field('height', 'Height', bean.height, (v) => bean.height = v),
+          _field('weight', 'Weight', bean.weight, (v) => bean.weight = v),
+        ),
+        _field('fatherName', "Father's name", bean.fatherName,
+            (v) => bean.fatherName = v),
+        _field('spouseName', 'Spouse name', bean.spouseName,
+            (v) => bean.spouseName = v),
+        _dateField('Marriage date', bean.marriageDate,
+            (d) => setState(() => bean.marriageDate = d),
+            lastDate: DateTime.now()),
+        _row(
+          _field('nationality', 'Nationality', bean.nationality,
+              (v) => bean.nationality = v),
+          _field('country', 'Country', bean.country, (v) => bean.country = v),
+        ),
+        _field('personalEmail', 'Personal email', bean.personalEmail,
+            (v) => bean.personalEmail = v,
+            keyboardType: TextInputType.emailAddress),
+        // Required, except under onboarding rules, where the web hides both.
+        if (!_onboardingRules) ...[
+          _field('emergencyContactName', 'Emergency contact name',
+              bean.emergencyContactName, (v) => bean.emergencyContactName = v,
+              required: true),
           _field(
               'emergencyContactNumber',
-              'Emergency number',
+              'Emergency contact number',
               bean.emergencyContactNumber,
               (v) => bean.emergencyContactNumber = v,
+              required: true,
               keyboardType: TextInputType.phone,
-              digitsOnly: true),
-        ),
+              maxLength: 10,
+              digitsOnly: true, validator: (value) {
+            final text = (value ?? '').trim();
+            if (text.isEmpty) return 'Emergency Contact Number is required.';
+            return RegExp(r'^[0-9]{10}$').hasMatch(text)
+                ? null
+                : 'Emergency contact number must be 10 digits.';
+          }),
+        ],
         _field('policeStationLimits', 'Police station limits',
             bean.policeStationLimits, (v) => bean.policeStationLimits = v),
         // Entered, not derived. Neither the web nor the backend works it out
@@ -732,25 +1069,39 @@ class _EmployeeFormScreenState extends State<EmployeeFormScreen> {
         _field('age', 'Age', bean.age?.toString() ?? '',
             (v) => bean.age = int.tryParse(v.trim()),
             keyboardType: TextInputType.number, digitsOnly: true, maxLength: 3),
-        _row(
-          _field('esiNumber', 'ESI number', bean.esiNumber,
-              (v) => bean.esiNumber = v),
-          _field('pfUanNo', 'PF UAN number', bean.pfUanNo,
-              (v) => bean.pfUanNo = v),
-        ),
-        // Locked once the answer is Yes on an existing employee: the login has
-        // already been created, so switching it off here would not remove it.
-        // The web disables the same control under the same condition.
+        _field('plcaeOfBirth', 'Place of birth', bean.plcaeOfBirth,
+            (v) => bean.plcaeOfBirth = v),
         _choice(
-          'Create a login for this employee',
-          bean.isAddAsUserNeeded,
-          const ['Yes', 'No'],
-          (v) => setState(() => bean.isAddAsUserNeeded = v),
-          enabled: !(_isEdit && bean.isAddAsUserNeeded == 'Yes'),
-          note: _isEdit && bean.isAddAsUserNeeded == 'Yes'
-              ? 'This employee already has a login, so this cannot be changed here.'
-              : null,
-        ),
+            'Physically challenged',
+            bean.physicallyChallenged,
+            const ['Yes', 'No'],
+            (v) => setState(() => bean.physicallyChallenged = v)),
+        // The web's Employee Health switch. 'Y'/'N' on the wire; turning it
+        // off clears the description, as the web does.
+        _choice(
+            'Health issue',
+            bean.healthIssue == 'Y' ? 'Yes' : 'No',
+            const ['Yes', 'No'],
+            (v) => setState(() {
+                  bean.healthIssue = v == 'Yes' ? 'Y' : 'N';
+                  if (bean.healthIssue != 'Y') {
+                    bean.healthIssueDescription = '';
+                    bean.healthIssueUrl = '';
+                    _pickedDocuments.remove('Health_issue');
+                    _setText('healthIssueDescription', '');
+                  }
+                })),
+        if (bean.healthIssue == 'Y')
+          _field(
+              'healthIssueDescription',
+              'Health issue description',
+              bean.healthIssueDescription,
+              (v) => bean.healthIssueDescription = v,
+              required: true,
+              maxLines: 3),
+        if (bean.healthIssue == 'Y')
+          _attachmentRow(
+              'Health_issue', 'Health issue document', bean.healthIssueUrl),
       ],
     );
   }
@@ -773,7 +1124,10 @@ class _EmployeeFormScreenState extends State<EmployeeFormScreen> {
           items: _projects,
           idOf: (p) => p.projectId,
           labelOf: (p) => p.projectName,
-          onChanged: (v) => setState(() => bean.projectAssigned = v),
+          onChanged: (v) {
+            setState(() => bean.projectAssigned = v);
+            if (_onboardingRules && v != null) _loadLocationsForProject(v);
+          },
           required: true,
         ),
         _searchableRefDropdown<ManagerOption>(
@@ -786,26 +1140,29 @@ class _EmployeeFormScreenState extends State<EmployeeFormScreen> {
           onChanged: (v) => setState(() => bean.reportingManager = v),
           required: true,
         ),
-        _searchableRefDropdown<ManagerOption>(
+        // An EMPLOYEE, not a user: the web lists `getAllEmpoyees` and stores
+        // the employee row id here.
+        _searchableRefDropdown<EmployeeOption>(
           key: 'attendanceManager',
           label: 'Attendance manager',
           value: bean.attendanceManager,
-          items: _managers,
-          idOf: (m) => m.userId,
-          labelOf: (m) => m.userName,
+          items: _attendanceManagers,
+          idOf: (e) => e.id,
+          labelOf: (e) => e.name,
           onChanged: (v) => setState(() => bean.attendanceManager = v),
           required: true,
         ),
-        _searchableRefDropdown<RoleOption>(
-          key: 'employeeRoleId',
-          label: 'Role',
-          value: bean.employeeRoleId,
-          items: _roles,
-          idOf: (r) => r.roleId,
-          labelOf: (r) => r.roleName,
-          onChanged: (v) => setState(() => bean.employeeRoleId = v),
-          required: true,
-        ),
+        if (_showsRole)
+          _searchableRefDropdown<RoleOption>(
+            key: 'employeeRoleId',
+            label: 'Role',
+            value: bean.employeeRoleId,
+            items: _roles,
+            idOf: (r) => r.roleId,
+            labelOf: (r) => r.roleName,
+            onChanged: (v) => setState(() => bean.employeeRoleId = v),
+            required: true,
+          ),
         _searchableRefDropdown<WorkLocationOption>(
           key: 'workLocation',
           label: 'Work location',
@@ -826,18 +1183,25 @@ class _EmployeeFormScreenState extends State<EmployeeFormScreen> {
         _field('designation', 'Designation', bean.designation,
             (v) => bean.designation = v,
             required: true),
-        _refDropdown('Shift', _shifts, bean.shiftId,
-            (v) => setState(() => bean.shiftId = v),
-            required: true),
-        // `shift` is NOT a label for shiftId — it is the rotational-shift flag,
-        // and attendance reads it as `employee.getShift().equals("Yes")`. Free
-        // text here would write something that comparison can never match.
-        _choice('Rotational shift', bean.shift, const ['Yes', 'No'],
-            (v) => setState(() => bean.shift = v)),
+        // Hidden under onboarding rules, as on the web.
+        if (!_onboardingRules) ...[
+          _refDropdown('Shift', _shifts, bean.shiftId,
+              (v) => setState(() => bean.shiftId = v),
+              required: true),
+          // `shift` is NOT a label for shiftId — it is the rotational-shift
+          // flag, and attendance reads it as `employee.getShift().equals("Yes")`.
+          // Free text here would write something that comparison never matches.
+          _choice('Rotational shift', bean.shift, const ['Yes', 'No'],
+              (v) => setState(() => bean.shift = v),
+              required: true),
+        ],
         _refDropdownByValue('Employee status', _employeeStatuses,
             bean.employeeStatus, (v) => setState(() => bean.employeeStatus = v),
             required: true),
-        _choice('In probation', bean.isInProbation, const ['Yes', 'No'],
+        _choice(
+            'In probation',
+            bean.isInProbation,
+            const ['Yes', 'No'],
             (v) => setState(() {
                   bean.isInProbation = v;
                   // Turning probation off clears the period, as the web does —
@@ -862,7 +1226,9 @@ class _EmployeeFormScreenState extends State<EmployeeFormScreen> {
               keyboardType: TextInputType.number,
               digitsOnly: true, validator: (value) {
             final days = int.tryParse((value ?? '').trim());
-            if (days == null || days < 1) return 'Enter probation period days';
+            if (days == null || days < 1) {
+              return 'Enter Probation Period (days).';
+            }
             return null;
           }),
         _dateField('Confirmation date', bean.confirmationDate,
@@ -1038,8 +1404,10 @@ class _EmployeeFormScreenState extends State<EmployeeFormScreen> {
                 ? () => _removeChildRow(
                       id: row.id,
                       delete: ApiService.deleteEmployeeEducation,
-                      removeLocally: () =>
-                          _dto.employeeEducationBeanList.removeAt(index),
+                      removeLocally: () {
+                        _dto.employeeEducationBeanList.removeAt(index);
+                        _shiftRowDocuments('education', index);
+                      },
                       what: 'education entry',
                     )
                 : null,
@@ -1070,6 +1438,9 @@ class _EmployeeFormScreenState extends State<EmployeeFormScreen> {
               ),
               _field('edu${index}Remarks', 'Remarks', row.remarks,
                   (v) => row.remarks = v),
+              if (_onboardingRules)
+                _attachmentRow('education_$index', 'Education certificate',
+                    row.attachmentUrl),
             ],
           );
         }),
@@ -1087,15 +1458,18 @@ class _EmployeeFormScreenState extends State<EmployeeFormScreen> {
       id: 'bank',
       title: 'Bank Details',
       icon: Icons.account_balance_outlined,
+      subtitle: _onboardingRules ? 'Required' : 'Optional',
       children: [
-        _field(
-            'bankName', 'Bank name', bank.bankName, (v) => bank.bankName = v),
+        _field('bankName', 'Bank name', bank.bankName, (v) => bank.bankName = v,
+            required: _onboardingRules),
         _field('bankAccountNumber', 'Account number', bank.bankAccountNumber,
             (v) => bank.bankAccountNumber = v,
-            keyboardType: TextInputType.number, digitsOnly: true),
+            required: _onboardingRules,
+            keyboardType: TextInputType.number,
+            digitsOnly: true),
         _field('bankIfscCode', 'IFSC code', bank.bankIfscCode,
             (v) => bank.bankIfscCode = v.toUpperCase(),
-            upperCase: true),
+            required: _onboardingRules, upperCase: true),
         _field('accountType', 'Account type', bank.accountType,
             (v) => bank.accountType = v),
         _dateField('Account opening date', bank.accountOpeningDate,
@@ -1130,6 +1504,10 @@ class _EmployeeFormScreenState extends State<EmployeeFormScreen> {
         ],
         _choice('LWF', bank.lwfInclude, const ['Yes', 'No'],
             (v) => setState(() => bank.lwfInclude = v)),
+        if (_onboardingRules)
+          _attachmentRow(
+              'bank', 'Bank passbook / cancelled cheque', bank.attachmentUrl,
+              required: true),
       ],
     );
   }
@@ -1139,7 +1517,8 @@ class _EmployeeFormScreenState extends State<EmployeeFormScreen> {
       id: 'family',
       title: 'Family Details',
       icon: Icons.family_restroom_outlined,
-      subtitle: '${_dto.employeeFamilyBeanList.length} entered',
+      subtitle:
+          '${_onboardingRules ? 'Required · ' : ''}${_dto.employeeFamilyBeanList.length} entered',
       children: [
         ..._dto.employeeFamilyBeanList.asMap().entries.map((entry) {
           final index = entry.key;
@@ -1150,19 +1529,31 @@ class _EmployeeFormScreenState extends State<EmployeeFormScreen> {
                 ? () => _removeChildRow(
                       id: row.id,
                       delete: ApiService.deleteEmployeeFamily,
-                      removeLocally: () =>
-                          _dto.employeeFamilyBeanList.removeAt(index),
+                      removeLocally: () {
+                        _dto.employeeFamilyBeanList.removeAt(index);
+                        _shiftRowDocuments('family_member', index);
+                        if (_emergencyIndex == index) {
+                          _emergencyIndex = null;
+                        } else if ((_emergencyIndex ?? -1) > index) {
+                          _emergencyIndex = _emergencyIndex! - 1;
+                        }
+                      },
                       what: 'family member',
                     )
                 : null,
             children: [
-              _field('fam${index}Name', 'Name', row.name, (v) => row.name = v),
+              _field('fam${index}Name', 'Name', row.name, (v) => row.name = v,
+                  required: _onboardingRules),
               _row(
                 _field('fam${index}Rel', 'Relationship', row.relationship,
-                    (v) => row.relationship = v),
+                    (v) => row.relationship = v,
+                    required: _onboardingRules),
                 _field('fam${index}Contact', 'Contact no', row.contactNo,
                     (v) => row.contactNo = v,
-                    keyboardType: TextInputType.phone, digitsOnly: true),
+                    required: _onboardingRules,
+                    keyboardType: TextInputType.phone,
+                    maxLength: 10,
+                    digitsOnly: true),
               ),
               _row(
                 _dateField('Date of birth', row.dateOfBirth,
@@ -1177,22 +1568,45 @@ class _EmployeeFormScreenState extends State<EmployeeFormScreen> {
                   keyboardType: TextInputType.emailAddress),
               _field('fam${index}Address', 'Address', row.address,
                   (v) => row.address = v,
-                  maxLines: 2),
+                  required: _onboardingRules, maxLines: 2),
               _row(
-                _field(
-                    'fam${index}City', 'City', row.city, (v) => row.city = v),
+                _field('fam${index}City', 'City', row.city, (v) => row.city = v,
+                    required: _onboardingRules),
                 _field('fam${index}Pin', 'Pincode', row.pincode,
                     (v) => row.pincode = v,
-                    keyboardType: TextInputType.number, digitsOnly: true),
+                    required: _onboardingRules,
+                    keyboardType: TextInputType.number,
+                    digitsOnly: true),
               ),
-              _row(
-                _field('fam${index}Country', 'Country', row.country,
-                    (v) => row.country = v),
-                _field('fam${index}MemberId', 'Family member id',
-                    row.familyMemberId, (v) => row.familyMemberId = v),
-              ),
+              // No editable "Family member id": on the web that column holds
+              // the member's ID-card link, so typing into it would break it.
+              _field('fam${index}Country', 'Country', row.country,
+                  (v) => row.country = v,
+                  required: _onboardingRules),
               _field('fam${index}Remarks', 'Remarks', row.remarks,
                   (v) => row.remarks = v),
+              // `familyMemberId` holds the stored ID-card link.
+              _attachmentRow(
+                  'family_member_$index', 'ID card', row.familyMemberId),
+              if (_onboardingRules)
+                _choice(
+                  'Emergency contact',
+                  _emergencyIndex == index ? 'Yes' : 'No',
+                  const ['Yes', 'No'],
+                  (v) => setState(() {
+                    if (v == 'Yes') {
+                      _emergencyIndex = index;
+                    } else if (_emergencyIndex == index) {
+                      _emergencyIndex = null;
+                    }
+                  }),
+                  note: _emergencyIndex == index &&
+                          row.contactNo.trim().isNotEmpty &&
+                          row.contactNo.trim() ==
+                              _dto.employeeBean.phoneNumber.trim()
+                      ? 'Emergency contact number must be different from the employee phone number'
+                      : null,
+                ),
             ],
           );
         }),
@@ -1220,8 +1634,10 @@ class _EmployeeFormScreenState extends State<EmployeeFormScreen> {
                 ? () => _removeChildRow(
                       id: row.id,
                       delete: ApiService.deleteEmployeeExperience,
-                      removeLocally: () =>
-                          _dto.employeeExperienceBeanList.removeAt(index),
+                      removeLocally: () {
+                        _dto.employeeExperienceBeanList.removeAt(index);
+                        _shiftRowDocuments('experience', index);
+                      },
                       what: 'experience entry',
                     )
                 : null,
@@ -1245,6 +1661,9 @@ class _EmployeeFormScreenState extends State<EmployeeFormScreen> {
               _field('exp${index}Desc', 'Job description', row.jobdescription,
                   (v) => row.jobdescription = v,
                   maxLines: 3),
+              if (_onboardingRules)
+                _attachmentRow('experience_$index', 'Experience letter',
+                    row.attachmentUrl),
             ],
           );
         }),
@@ -1261,11 +1680,13 @@ class _EmployeeFormScreenState extends State<EmployeeFormScreen> {
       id: 'documents',
       title: 'Documents',
       icon: Icons.folder_outlined,
-      subtitle: _pickedDocuments.isEmpty
+      subtitle: _documentSlots.every((d) => _pickedDocuments[d.prefix] == null)
           ? 'Aadhaar required · PAN, Voter ID, Passport, Ration card'
-          : '${_pickedDocuments.length} ready to upload',
+          : '${_documentSlots.where((d) => _pickedDocuments[d.prefix] != null).length} ready to upload',
       children: [
-        for (final slot in _documentSlots) _documentRow(slot),
+        for (final slot in _documentSlots)
+          _attachmentRow(slot.prefix, slot.label, _storedDocument(slot.field),
+              required: slot.prefix == 'Adhar_card'),
         const SizedBox(height: 8),
         Text(
           'Files are uploaded with the record when you save. A document already '
@@ -1276,10 +1697,17 @@ class _EmployeeFormScreenState extends State<EmployeeFormScreen> {
     );
   }
 
-  Widget _documentRow(_DocumentSlot slot) {
-    final picked = _pickedDocuments[slot.field];
-    final stored = _storedDocument(slot.field);
-    final hasStored = stored.isNotEmpty;
+  String _extension(String path) {
+    final name = path.split('/').last;
+    final dot = name.lastIndexOf('.');
+    return dot < 0 ? 'jpg' : name.substring(dot + 1).toLowerCase();
+  }
+
+  /// One upload: a file picked now, one already on the record, or neither.
+  Widget _attachmentRow(String docKey, String label, String stored,
+      {bool required = false}) {
+    final picked = _pickedDocuments[docKey];
+    final hasStored = stored.trim().isNotEmpty;
 
     return Padding(
       padding: const EdgeInsets.only(bottom: 10),
@@ -1303,7 +1731,7 @@ class _EmployeeFormScreenState extends State<EmployeeFormScreen> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(slot.label,
+                Text(required ? '$label *' : label,
                     style: TextStyle(
                         color: AppColors.textPrimary,
                         fontSize: 13,
@@ -1320,14 +1748,22 @@ class _EmployeeFormScreenState extends State<EmployeeFormScreen> {
               ],
             ),
           ),
+          if (picked != null || hasStored)
+            IconButton(
+              tooltip: 'View',
+              visualDensity: VisualDensity.compact,
+              icon: const Icon(Icons.visibility_outlined,
+                  size: 18, color: AppColors.primary),
+              onPressed: () => _viewDocument(label, picked, stored),
+            ),
           if (picked != null)
             IconButton(
+              visualDensity: VisualDensity.compact,
               icon: const Icon(Icons.close, size: 18, color: AppColors.danger),
-              onPressed: () =>
-                  setState(() => _pickedDocuments.remove(slot.field)),
+              onPressed: () => setState(() => _pickedDocuments.remove(docKey)),
             ),
           TextButton(
-            onPressed: () => _pickDocument(slot),
+            onPressed: () => _pickDocument(docKey),
             child: Text(picked != null || hasStored ? 'Replace' : 'Upload',
                 style: const TextStyle(
                     color: AppColors.primary,
@@ -1335,6 +1771,142 @@ class _EmployeeFormScreenState extends State<EmployeeFormScreen> {
                     fontWeight: FontWeight.w600)),
           ),
         ],
+      ),
+    );
+  }
+
+  bool _isImageName(String name) {
+    final ext = _extension(name.split('?').first);
+    return ext == 'jpg' || ext == 'jpeg' || ext == 'png';
+  }
+
+  /// The web's "View": the file picked in this session if there is one (what
+  /// will be saved), otherwise the copy on the record. Images open in the app;
+  /// PDFs go to the phone's own viewer.
+  Future<void> _viewDocument(String label, File? picked, String stored) async {
+    if (picked != null) {
+      if (_isImageName(picked.path)) {
+        _showImage(label, Image.file(picked, fit: BoxFit.contain));
+      } else {
+        await _openExternally(picked.path);
+      }
+      return;
+    }
+
+    final url = stored.trim();
+    // Older records hold a bare file name rather than a link; the server
+    // cannot fetch those, so say so instead of failing quietly.
+    if (!url.startsWith('http')) {
+      _toast('This $label link is broken. Please upload it again.',
+          error: true);
+      return;
+    }
+
+    _showBusy();
+    try {
+      final response = await ApiService.downloadEmployeeDocument(
+          label.replaceAll(' ', '_'), url);
+      final type = response.headers['content-type'] ?? '';
+      if (response.statusCode < 200 ||
+          response.statusCode >= 300 ||
+          response.bodyBytes.isEmpty ||
+          type.contains('html') ||
+          type.contains('json') ||
+          type.contains('xml')) {
+        debugPrint('Employee form: view $label failed '
+            '${response.statusCode} $type');
+        _hideBusy();
+        _toast(
+            response.statusCode == 404
+                ? 'This $label was not found. Please upload it again.'
+                : 'Could not open the $label. Please try again.',
+            error: true);
+        return;
+      }
+      _hideBusy();
+      if (type.startsWith('image/')) {
+        _showImage(
+            label, Image.memory(response.bodyBytes, fit: BoxFit.contain));
+        return;
+      }
+      final name = url.split('?').first.split('/').last;
+      final dir = await getTemporaryDirectory();
+      final file =
+          File('${dir.path}/view_${DateTime.now().millisecondsSinceEpoch}'
+              '.${type.contains('pdf') ? 'pdf' : _extension(name)}');
+      await file.writeAsBytes(response.bodyBytes, flush: true);
+      await _openExternally(file.path);
+    } catch (e) {
+      debugPrint('Employee form: view $label error $e');
+      _hideBusy();
+      _toast('Could not open the $label. Check your connection.', error: true);
+    }
+  }
+
+  Future<void> _openExternally(String path) async {
+    final result = await OpenFile.open(path);
+    if (result.type != ResultType.done) {
+      debugPrint('Employee form: open file ${result.type} ${result.message}');
+      _toast('No app found on this phone to open this file.', error: true);
+    }
+  }
+
+  bool _busyShown = false;
+
+  void _showBusy() {
+    _busyShown = true;
+    showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => const Center(
+          child: CircularProgressIndicator(color: AppColors.primary)),
+    ).then((_) => _busyShown = false);
+  }
+
+  void _hideBusy() {
+    // Cleared here, not only in the dialog's `then` (which runs a frame
+    // later), so a second call cannot pop the form itself.
+    if (!_busyShown || !mounted) return;
+    _busyShown = false;
+    Navigator.of(context, rootNavigator: true).pop();
+  }
+
+  void _showImage(String label, Widget image) {
+    showDialog<void>(
+      context: context,
+      builder: (dialog) => Dialog(
+        backgroundColor: AppColors.surface,
+        insetPadding: const EdgeInsets.all(12),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 8, 4, 0),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Text(label,
+                        style: TextStyle(
+                            color: AppColors.textPrimary,
+                            fontSize: 15,
+                            fontWeight: FontWeight.w700)),
+                  ),
+                  IconButton(
+                    icon: Icon(Icons.close, color: AppColors.textSecondary),
+                    onPressed: () => Navigator.pop(dialog),
+                  ),
+                ],
+              ),
+            ),
+            Flexible(
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(8, 0, 8, 12),
+                // Pinch to zoom — card photos are read at a glance otherwise.
+                child: InteractiveViewer(maxScale: 5, child: image),
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -1357,18 +1929,68 @@ class _EmployeeFormScreenState extends State<EmployeeFormScreen> {
     }
   }
 
-  Future<void> _pickDocument(_DocumentSlot slot) async {
+  /// Camera or file. A photo of the card is the common case on a phone; a
+  /// file covers PDFs and scans. Both end up as jpg/jpeg/png/pdf — the types
+  /// the web accepts.
+  Future<void> _pickDocument(String docKey) async {
+    final source = await showModalBottomSheet<String>(
+      context: context,
+      backgroundColor: AppColors.surface,
+      shape: const RoundedRectangleBorder(
+          borderRadius: BorderRadius.vertical(top: Radius.circular(16))),
+      builder: (sheet) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: const Icon(Icons.photo_camera_outlined,
+                  color: AppColors.primary),
+              title: Text('Take photo',
+                  style: TextStyle(color: AppColors.textPrimary)),
+              onTap: () => Navigator.pop(sheet, 'camera'),
+            ),
+            ListTile(
+              leading: const Icon(Icons.folder_open_outlined,
+                  color: AppColors.primary),
+              title: Text('Choose file',
+                  style: TextStyle(color: AppColors.textPrimary)),
+              subtitle: Text('JPG, PNG or PDF',
+                  style: TextStyle(color: AppColors.textFaint, fontSize: 12)),
+              onTap: () => Navigator.pop(sheet, 'file'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (source == null) return;
+
     try {
-      final result = await FilePicker.platform.pickFiles(
-        type: FileType.custom,
-        allowedExtensions: const ['jpg', 'jpeg', 'png', 'pdf'],
-      );
-      final path = result?.files.single.path;
+      String? path;
+      if (source == 'camera') {
+        // Compressed: a full-resolution photo is several MB per document and
+        // all of them go up in one request.
+        final photo = await ImagePicker().pickImage(
+          source: ImageSource.camera,
+          imageQuality: 70,
+          maxWidth: 2000,
+        );
+        path = photo?.path;
+      } else {
+        final result = await FilePicker.platform.pickFiles(
+          type: FileType.custom,
+          allowedExtensions: const ['jpg', 'jpeg', 'png', 'pdf'],
+        );
+        path = result?.files.single.path;
+      }
       if (path == null) return;
-      setState(() => _pickedDocuments[slot.field] = File(path));
+      setState(() => _pickedDocuments[docKey] = File(path!));
     } catch (e) {
       debugPrint('Employee form: document pick error $e');
-      _toast('Could not open the file picker.', error: true);
+      _toast(
+          source == 'camera'
+              ? 'Could not open the camera. Check camera permission.'
+              : 'Could not open the file picker.',
+          error: true);
     }
   }
 
@@ -1397,30 +2019,42 @@ class _EmployeeFormScreenState extends State<EmployeeFormScreen> {
     bool digitsOnly = false,
     bool upperCase = false,
     String? Function(String?)? validator,
+    VoidCallback? onBlur,
   }) {
+    final input = TextFormField(
+      controller: _controller(key, initial),
+      keyboardType: keyboardType,
+      maxLines: maxLines,
+      maxLength: maxLength,
+      textCapitalization:
+          upperCase ? TextCapitalization.characters : TextCapitalization.none,
+      inputFormatters: [
+        if (digitsOnly) FilteringTextInputFormatter.digitsOnly,
+        if (upperCase) _UpperCaseFormatter(),
+      ],
+      style: TextStyle(color: AppColors.textPrimary, fontSize: 14),
+      cursorColor: AppColors.primary,
+      decoration: fieldDecoration(required ? '$label *' : label)
+          .copyWith(counterText: ''),
+      onChanged: onChanged,
+      validator: validator ??
+          (required
+              ? (value) =>
+                  (value ?? '').trim().isEmpty ? '$label is required.' : null
+              : null),
+    );
     return Padding(
       padding: const EdgeInsets.only(bottom: 12),
-      child: TextFormField(
-        controller: _controller(key, initial),
-        keyboardType: keyboardType,
-        maxLines: maxLines,
-        maxLength: maxLength,
-        textCapitalization:
-            upperCase ? TextCapitalization.characters : TextCapitalization.none,
-        inputFormatters: [
-          if (digitsOnly) FilteringTextInputFormatter.digitsOnly,
-          if (upperCase) _UpperCaseFormatter(),
-        ],
-        style: TextStyle(color: AppColors.textPrimary, fontSize: 14),
-        cursorColor: AppColors.primary,
-        decoration: fieldDecoration(required ? '$label *' : label)
-            .copyWith(counterText: ''),
-        onChanged: onChanged,
-        validator: validator ??
-            (required
-                ? (value) => (value ?? '').trim().isEmpty ? 'Required' : null
-                : null),
-      ),
+      // The web runs its duplicate checks on blur.
+      child: onBlur == null
+          ? input
+          : Focus(
+              skipTraversal: true,
+              onFocusChange: (hasFocus) {
+                if (!hasFocus) onBlur();
+              },
+              child: input,
+            ),
     );
   }
 
@@ -1566,8 +2200,9 @@ class _EmployeeFormScreenState extends State<EmployeeFormScreen> {
                 ))
             .toList(),
         onChanged: onChanged,
-        validator:
-            required ? (value) => value == null ? 'Required' : null : null,
+        validator: required
+            ? (value) => value == null ? '$label is required.' : null
+            : null,
       ),
     );
   }
@@ -1594,7 +2229,35 @@ class _EmployeeFormScreenState extends State<EmployeeFormScreen> {
             .toList(),
         onChanged: (v) => onChanged(v ?? ''),
         validator: required
-            ? (v) => (v ?? '').trim().isEmpty ? 'Required' : null
+            ? (v) => (v ?? '').trim().isEmpty ? '$label is required.' : null
+            : null,
+      ),
+    );
+  }
+
+  /// A fixed list of strings as a dropdown. A stored value outside the list is
+  /// still shown, so an older record does not render as unset.
+  Widget _stringDropdown(String label, List<String> options, String value,
+      ValueChanged<String> onChanged,
+      {bool required = false}) {
+    final items = [
+      ...options,
+      if (value.trim().isNotEmpty && !options.contains(value)) value,
+    ];
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 12),
+      child: DropdownButtonFormField2<String?>(
+        isExpanded: true,
+        value: value.trim().isEmpty ? null : value,
+        decoration: fieldDecoration(required ? '$label *' : label),
+        dropdownStyleData: menuStyle(context),
+        menuItemStyleData: kMenuItemStyle,
+        items: items
+            .map((o) => DropdownMenuItem<String?>(value: o, child: Text(o)))
+            .toList(),
+        onChanged: (v) => onChanged(v ?? ''),
+        validator: required
+            ? (v) => (v ?? '').trim().isEmpty ? '$label is required.' : null
             : null,
       ),
     );
@@ -1646,8 +2309,9 @@ class _EmployeeFormScreenState extends State<EmployeeFormScreen> {
                 ))
             .toList(),
         onChanged: onChanged,
-        validator:
-            required ? (value) => value == null ? 'Required' : null : null,
+        validator: required
+            ? (value) => value == null ? '$label is required.' : null
+            : null,
       ),
     );
   }
@@ -1733,7 +2397,18 @@ class _DocumentSlot {
   final String field;
   final String label;
 
-  const _DocumentSlot(this.field, this.label);
+  /// The web's docType, prepended to the uploaded filename.
+  final String prefix;
+
+  const _DocumentSlot(this.field, this.label, this.prefix);
+}
+
+/// A required answer that is missing, and the section it lives in.
+class _Missing {
+  final String section;
+  final String message;
+
+  const _Missing(this.section, this.message);
 }
 
 class _UpperCaseFormatter extends TextInputFormatter {
